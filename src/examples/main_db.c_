@@ -1,0 +1,81 @@
+#include "raylib.h"
+#include <pthread.h>
+
+typedef struct {
+    Image front;  // Main thread reads this
+    Image back;   // Worker thread writes to this
+    bool swap_ready;
+    pthread_mutex_t mutex;
+} DoubleBuffer;
+
+void *render_worker(void *arg) {
+    DoubleBuffer *buf = (DoubleBuffer *)arg;
+    int frame = 0;
+    
+    while (true) {
+        // Draw to back buffer (no locks needed during drawing)
+        ImageClearBackground(&buf->back, BLACK);
+        
+        for (int i = 0; i < 5000; i++) {
+            int x = GetRandomValue(0, 511);
+            int y = GetRandomValue(0, 511);
+            ImageDrawPixel(&buf->back, x, y, RED);
+        }
+        
+        ImageDrawText(&buf->back, TextFormat("Frame: %d", frame++), 
+                     10, 10, 20, WHITE);
+        
+        // Signal swap
+        pthread_mutex_lock(&buf->mutex);
+        
+        // Swap front and back
+        Image temp = buf->front;
+        buf->front = buf->back;
+        buf->back = temp;
+        
+        buf->swap_ready = true;
+        pthread_mutex_unlock(&buf->mutex);
+        
+        usleep(16666);  // ~60 FPS
+    }
+    return NULL;
+}
+
+int main(void) {
+    InitWindow(800, 600, "Double Buffered");
+    SetTargetFPS(60);
+    
+    DoubleBuffer buf = {
+        .front = GenImageColor(512, 512, BLACK),
+        .back = GenImageColor(512, 512, BLACK),
+        .swap_ready = false
+    };
+    pthread_mutex_init(&buf.mutex, NULL);
+    
+    pthread_t thread;
+    pthread_create(&thread, NULL, render_worker, &buf);
+    
+    Texture2D texture = LoadTextureFromImage(buf.front);
+    
+    while (!WindowShouldClose()) {
+        // Check for new frame
+        pthread_mutex_lock(&buf.mutex);
+        if (buf.swap_ready) {
+            UpdateTexture(texture, buf.front.data);
+            buf.swap_ready = false;
+        }
+        pthread_mutex_unlock(&buf.mutex);
+        
+        BeginDrawing();
+            ClearBackground(DARKGRAY);
+            DrawTexture(texture, 144, 44, WHITE);
+            DrawFPS(10, 10);
+        EndDrawing();
+    }
+    
+    UnloadImage(buf.front);
+    UnloadImage(buf.back);
+    UnloadTexture(texture);
+    CloseWindow();
+    return 0;
+}

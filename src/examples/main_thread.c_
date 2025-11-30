@@ -1,0 +1,135 @@
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <stdbool.h>
+#include <time.h>
+#include <errno.h>
+
+// Mutex and condition variable for thread synchronization
+pthread_mutex_t work_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t work_cond = PTHREAD_COND_INITIALIZER;
+pthread_cond_t done_cond = PTHREAD_COND_INITIALIZER;
+
+bool work_ready = false;
+bool work_done = false;
+bool thread_should_exit = false;
+
+// Thread function
+void* worker_function(void* arg) {
+    printf("Worker thread: Started (TID: %ld)\n", (long)pthread_self());
+    
+    while (1) {
+        // Wait for work signal
+        pthread_mutex_lock(&work_mutex);
+        printf("Worker thread: Waiting for work...\n");
+        while (!work_ready && !thread_should_exit) {
+            pthread_cond_wait(&work_cond, &work_mutex);
+        }
+        
+        // Check if we should exit
+        if (thread_should_exit) {
+            pthread_mutex_unlock(&work_mutex);
+            break;
+        }
+        
+        // We have work to do
+        work_ready = false;
+        pthread_mutex_unlock(&work_mutex);
+
+        // ---- actual work below here
+        
+        // Do the actual work (outside the lock)
+        printf("Worker thread: Received signal! Starting work...\n");
+        sleep(2);  // Simulate work
+        printf("Worker thread: Work completed!\n");
+        
+        // Signal main thread that work is done
+        pthread_mutex_lock(&work_mutex);
+        work_done = true;
+        pthread_cond_signal(&done_cond);
+        pthread_mutex_unlock(&work_mutex);
+        
+        // Loop back to wait for more work
+    }
+    
+    printf("Worker thread: Exiting\n");
+    return NULL;
+}
+
+int main() {
+    pthread_t worker_thread;
+    
+    printf("Main thread: Creating worker thread...\n");
+    
+    // Create the thread
+    if (pthread_create(&worker_thread, NULL, worker_function, NULL) != 0) {
+        perror("pthread_create failed");
+        exit(1);
+    }
+    
+    printf("Main thread: Thread created successfully\n");
+    
+    // Detach the thread
+    if (pthread_detach(worker_thread) != 0) {
+        perror("pthread_detach failed");
+        exit(1);
+    }
+    
+    printf("Main thread: Thread detached\n");
+    sleep(1);  // Give thread time to start
+    
+    // Send work signals multiple times
+    for (int i = 1; i <= 3; i++) {
+        printf("\n=== Main thread: Sending work signal #%d ===\n", i);
+        
+        // Signal the thread to do work
+        pthread_mutex_lock(&work_mutex);
+        work_ready = true;
+        work_done = false;
+        pthread_cond_signal(&work_cond);
+        pthread_mutex_unlock(&work_mutex);
+        
+        // Wait for the thread to complete the work (with timeout polling)
+        pthread_mutex_lock(&work_mutex);
+        printf("Main thread: Waiting for work completion...\n");
+        while (!work_done) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 500000000;  // Wait 500ms max
+            
+            // Handle nanosecond overflow
+            if (ts.tv_nsec >= 1000000000) {
+                ts.tv_sec += 1;
+                ts.tv_nsec -= 1000000000;
+            }
+            
+            int result = pthread_cond_timedwait(&done_cond, &work_mutex, &ts);
+            if (result == ETIMEDOUT) {
+                printf("Main thread: Still waiting... (doing other work)\n");
+                // You can do other work here while holding the lock,
+                // or unlock, do work, then re-lock
+            } else if (result != 0) {
+                printf("Main thread: Error waiting for condition\n");
+                break;
+            }
+        }
+        pthread_mutex_unlock(&work_mutex);
+        
+        printf("Main thread: Worker completed task #%d\n", i);
+        sleep(1);  // Pause between tasks
+    }
+    
+    // Tell the thread to exit
+    printf("\n=== Main thread: Signaling thread to exit ===\n");
+    pthread_mutex_lock(&work_mutex);
+    thread_should_exit = true;
+    pthread_cond_signal(&work_cond);
+    pthread_mutex_unlock(&work_mutex);
+    
+    // Since thread is detached, wait a bit for cleanup
+    sleep(2);
+    
+    printf("Main thread: Exiting\n");
+    return 0;
+}

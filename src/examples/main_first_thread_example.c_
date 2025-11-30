@@ -1,0 +1,74 @@
+#include "raylib.h"
+#include <pthread.h>
+#include <stdbool.h>
+
+typedef struct {
+    Image image;
+    bool ready;
+    pthread_mutex_t mutex;
+} SharedImage;
+
+void *draw_thread(void *arg) {
+    SharedImage *shared = (SharedImage *)arg;
+    
+    while (true) {
+        // Draw on the image (thread-safe, only modifies RAM)
+        for (int i = 0; i < 1000; i++) {
+            int x = GetRandomValue(0, 511);
+            int y = GetRandomValue(0, 511);
+            Color c = {GetRandomValue(0, 255), 
+                      GetRandomValue(0, 255), 
+                      GetRandomValue(0, 255), 255};
+            
+            ImageDrawPixel(&shared->image, x, y, c);
+        }
+        ImageDrawText(&shared->image, "booger", 10, 30, 20, WHITE);
+        
+        // Signal main thread
+        pthread_mutex_lock(&shared->mutex);
+        shared->ready = true;
+        pthread_mutex_unlock(&shared->mutex);
+        
+        usleep(1660660);  // ~60 FPS
+    }
+    return NULL;
+}
+
+int main(void) {
+    InitWindow(800, 600, "Threaded Stepper");
+    // SetTargetFPS(60);
+    
+    SharedImage shared = {
+        .image = GenImageColor(512, 512, BLACK),
+        .ready = false
+    };
+    pthread_mutex_init(&shared.mutex, NULL);
+    
+    // Start drawing thread
+    pthread_t thread;
+    pthread_create(&thread, NULL, draw_thread, &shared);
+    
+    Texture2D texture = LoadTextureFromImage(shared.image);
+    
+    while (!WindowShouldClose()) {
+        // Check if thread has new data
+        pthread_mutex_lock(&shared.mutex);
+        if (shared.ready) {
+            UpdateTexture(texture, shared.image.data);  // Main thread only
+            shared.ready = false;
+        }
+        pthread_mutex_unlock(&shared.mutex);
+        
+        BeginDrawing();
+            ClearBackground(DARKGRAY);
+            DrawTexture(texture, 144, 44, WHITE);
+            DrawFPS(10, 10);
+            DrawText("Drawing on thread!", 10, 30, 20, WHITE);
+        EndDrawing();
+    }
+    
+    UnloadImage(shared.image);
+    UnloadTexture(texture);
+    CloseWindow();
+    return 0;
+}

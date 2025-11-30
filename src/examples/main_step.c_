@@ -1,0 +1,233 @@
+//
+//  Created by Boyd Multerer on 2025-11-15.
+//  Copyright © 2025 Boyd Multerer. All rights reserved.
+//
+
+#include <stdlib.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <pthread.h>
+#include "raylib.h"
+
+#define DIM 1600
+#define NTHREADS 1
+
+#define LAMBDA      16
+#define INIT_VALUE  0.00001
+
+const float pi = 4 * atan(1);
+
+void* bin_a = 0;
+void* bin_b = 0;
+
+uint count = 0;
+
+uint render_plane = DIM / 2;
+
+
+// Global variable to store the thread ID
+pthread_t worker_thread;
+
+pthread_mutex_t work_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t work_cond = PTHREAD_COND_INITIALIZER;
+pthread_cond_t done_cond = PTHREAD_COND_INITIALIZER;
+
+
+
+// Shared data between threads
+typedef struct {
+  int progress;
+  bool isComplete;
+  pthread_mutex_t mutex;  // Protect shared data
+} WorkData;
+
+void emit(uint cx, uint cy, uint cz, void* a, void* b) {
+  float (*present)[DIM][DIM] = (float (*)[DIM][DIM])a;
+  float (*trend)[DIM][DIM] = (float (*)[DIM][DIM])b;
+
+  int x, y, z; // three-dimensional Cartesian coordinates.
+  float distance, curve, radian, impulse = 1000000 / (LAMBDA * LAMBDA * LAMBDA);
+  float xSquared, ySquared, zSquared; // float advisable for use with sqrt operator below.
+  int halfLambda = LAMBDA / 2; // full lambda cubic area below.
+  float phase = 2 * pi * count / LAMBDA; // amplitude modulation.
+
+  for (x = -halfLambda; x < halfLambda; x++) {
+      xSquared = x * x;
+      for (y = -halfLambda; y < halfLambda; y++) {
+          ySquared = y * y;
+          for (z = -halfLambda; z < halfLambda; z++) {
+              zSquared = z * z; // scanning the cube in-depth.
+              distance = sqrt(xSquared + ySquared + zSquared); // distance to the center (Pythagoras).
+              radian = 2 * pi * distance / LAMBDA;
+              if (distance <= halfLambda) { // spherical source (radius = LAMBDA / 2).
+                  if (radian < .001) radian = .001; // avoid division by zero.
+                  curve = sin(radian) / radian; // sinus cardinalis (Jocelyn Marcotte's electron curve).
+                  present[x+cx][y+cy][z+cz] += cos(phase) * curve * impulse;
+                  trend[x+cx][y+cy][z+cz] -= cos(phase) * curve * impulse;
+              }
+  }}}
+}
+
+
+void do_step( unsigned int n, void* a, void* b ) {
+  int slice = DIM / NTHREADS + (DIM % NTHREADS) / NTHREADS;
+  int start = n * slice;
+  int stop = start + slice;
+
+  // account for remainders and offsets
+  if ( start == 0 ) { start = 1; }
+  if ( n == NTHREADS - 1) { stop = DIM - 1; }
+
+  // printf("n:%d, dim:%d, start:%d, stop:%d, slice:%d\n", job->n, job->dim, start, stop, slice);
+
+  float (*past)[DIM][DIM] = (float (*)[DIM][DIM])a;
+  float (*present)[DIM][DIM] = (float (*)[DIM][DIM])b;
+  float (*trend)[DIM][DIM] = (float (*)[DIM][DIM])a;
+
+  float orthogonal, diagonal, vertices; // influence from neighboring cells.
+
+  // run the sim
+  for ( int x = 1; x < DIM-1; x++ ) {
+    for ( int y = 1; y < DIM-1; y++ ) {
+      for ( int z = start; z < stop; z++ ) {
+        orthogonal = present[x-1][y  ][z  ] + present[x  ][y-1][z  ] + present[x  ][y+1][z  ]
+                   + present[x  ][y  ][z-1] + present[x  ][y  ][z+1] + present[x+1][y  ][z  ];       // 6 orthogonal cells, gain = 3 / 13
+        diagonal   = present[x-1][y-1][z  ] + present[x  ][y-1][z-1] + present[x+1][y-1][z  ]
+                   + present[x-1][y  ][z-1] + present[x  ][y-1][z+1] + present[x+1][y  ][z-1]
+                   + present[x-1][y  ][z+1] + present[x  ][y+1][z-1] + present[x+1][y  ][z+1]
+                   + present[x-1][y+1][z  ] + present[x  ][y+1][z+1] + present[x+1][y+1][z  ];        // 12 diagonal cells, gain = 3 / 26
+        vertices   = present[x-1][y-1][z-1] + present[x-1][y-1][z+1] + present[x-1][y+1][z-1] + present[x-1][y+1][z+1]
+                   + present[x+1][y-1][z-1] + present[x+1][y-1][z+1] + present[x+1][y+1][z-1] + present[x+1][y+1][z+1]; // 8, gain 1 / 13
+        trend[x][y][z] = .23076923 * orthogonal + .1153846 * diagonal + .076923 * vertices - 1.384615 * present[x][y][z] - past[x][y][z];
+      }
+    }
+  }}
+
+void step( void* a, void* b ) {
+  do_step( 0, a, b );
+}
+
+
+void render( Image* img, void* a ) {
+  int amplitude;
+  uint r, g, b;
+  // Color color;
+  float (*present)[DIM][DIM] = (float (*)[DIM][DIM])a;
+
+  // render out
+  for ( uint y = 0; y < DIM; y++) {
+    for ( uint x = 0; x < DIM; x++) {
+
+      amplitude = present[x][y][render_plane]; // color distribution.
+      b = fabs(0.5 * amplitude);   // produces complementary magenta and emerald green.
+
+      if ( amplitude > 0) {
+        g = amplitude; // green color for positive amplitude.
+        if (g > 255) r = g - 255; else r = 0;
+      } else {
+        r = -amplitude; // red color for negative amplitude.
+        if (r > 255) g = r - 255; else g = 0;
+      }
+      if (r > 255) r = 255;
+      if (g > 255) g = 255;
+      if (b > 255) b = 255;
+
+      Color color = {r, g, b, 255};
+      ImageDrawPixel(img, x, y, color);
+    }
+  }
+
+
+
+  // for (int i = 0; i < 100; i++) {
+  //     int x = GetRandomValue(0, DIM);
+  //     int y = GetRandomValue(0, DIM);
+  //     Color c = {x, y, 128, 255};
+  //     ImageDrawPixel(img, x, y, BLUE);
+  // }
+}
+
+
+// Thread function - must return void* and take void* parameter
+void* heavy_work(void *arg) {    
+    return NULL;
+}
+
+
+int main(void) {
+    InitWindow(DIM, DIM, "Render to Texture");
+    SetTargetFPS(60);
+
+    // allocate the large sim buffers
+    size_t size = sizeof(float) * DIM * DIM * DIM;
+    bin_a = malloc( size );
+    if (!bin_a) {printf("Malloc a failed\n"); return -1;}
+    bin_b = malloc( size );
+    if (!bin_b) {printf("Malloc b failed\n"); return -1;}
+    memset(bin_a, 0, size);
+    memset(bin_b, 0, size);
+
+    // prepare render target
+    Image img = GenImageColor(DIM, DIM, BLACK);
+    Texture2D texture = LoadTextureFromImage(img);    
+
+    // ------
+    printf("Main thread: Creating worker thread...\n");    
+    // Create the thread
+    if (pthread_create(&worker_thread, NULL, worker_function, NULL) != 0) {
+        perror("pthread_create failed");
+        exit(1);
+    }
+    printf("Main thread: Thread created successfully\n");
+    
+    // Detach the thread
+    if (pthread_detach(worker_thread) != 0) {
+        perror("pthread_detach failed");
+        exit(1);
+    }
+    printf("Main thread: Thread detached\n");
+
+    // Give the thread/s time to set up its signal handler
+    sleep(2);
+
+
+    // ------
+    while (!WindowShouldClose()) {
+
+
+      // Signal the thread to do work
+      pthread_mutex_lock(&work_mutex);
+      work_ready = true;
+      work_done = false;
+      pthread_cond_signal(&work_cond);
+      pthread_mutex_unlock(&work_mutex);
+
+
+
+
+      if ( count % 2 ) {
+        printf("do ba\n");
+        emit( DIM / 2, DIM / 2, DIM / 2, bin_b, bin_a );
+        step( bin_b, bin_a );
+        render( &img, bin_a );
+      } else {
+        printf("do ab\n");
+        emit( DIM / 2, DIM / 2, DIM / 2, bin_a, bin_b );
+        step( bin_a, bin_b );
+        render( &img, bin_b );
+      }
+      UpdateTexture(texture, img.data);
+      count++;
+
+      BeginDrawing();
+        ClearBackground(RAYWHITE);
+        DrawTexture(texture, 0, 0, WHITE);
+      EndDrawing();
+    }
+
+    UnloadTexture(texture);
+    CloseWindow();
+    return 0;
+}

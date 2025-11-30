@@ -1,0 +1,238 @@
+#include "raylib.h"
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+
+#define FRAME_QUEUE_SIZE 120
+
+typedef struct {
+    unsigned char *data;
+    bool valid;
+} Frame;
+
+typedef struct {
+    Frame frames[FRAME_QUEUE_SIZE];
+    int write_idx;
+    int read_idx;
+    int count;
+    pthread_mutex_t mutex;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+    bool done;
+    int width;
+    int height;
+} FrameQueue;
+
+void frame_queue_init(FrameQueue *q, int width, int height) {
+    q->write_idx = 0;
+    q->read_idx = 0;
+    q->count = 0;
+    q->done = false;
+    q->width = width;
+    q->height = height;
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+    pthread_cond_init(&q->not_full, NULL);
+    
+    for (int i = 0; i < FRAME_QUEUE_SIZE; i++) {
+        q->frames[i].data = malloc(width * height * 4);
+        q->frames[i].valid = false;
+    }
+}
+
+void frame_queue_push(FrameQueue *q, unsigned char *data) {
+    pthread_mutex_lock(&q->mutex);
+    
+    while (q->count == FRAME_QUEUE_SIZE) {
+        pthread_cond_wait(&q->not_full, &q->mutex);
+    }
+    
+    memcpy(q->frames[q->write_idx].data, data, q->width * q->height * 4);
+    q->frames[q->write_idx].valid = true;
+    q->write_idx = (q->write_idx + 1) % FRAME_QUEUE_SIZE;
+    q->count++;
+    
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mutex);
+}
+
+Frame *frame_queue_pop(FrameQueue *q) {
+    pthread_mutex_lock(&q->mutex);
+    
+    while (q->count == 0 && !q->done) {
+        pthread_cond_wait(&q->not_empty, &q->mutex);
+    }
+    
+    if (q->count == 0 && q->done) {
+        pthread_mutex_unlock(&q->mutex);
+        return NULL;
+    }
+    
+    Frame *frame = &q->frames[q->read_idx];
+    q->read_idx = (q->read_idx + 1) % FRAME_QUEUE_SIZE;
+    q->count--;
+    
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->mutex);
+    
+    return frame;
+}
+
+void *encoder_thread(void *arg) {
+    FrameQueue *queue = (FrameQueue *)arg;
+    
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+        "ffmpeg -y -f rawvideo -pix_fmt rgba -s %dx%d -r 60 -i - "
+        "-c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p "
+        "output.mp4",
+        queue->width, queue->height);
+    
+    FILE *ffmpeg = popen(cmd, "w");
+    if (!ffmpeg) {
+        printf("Failed to start FFmpeg!\n");
+        return NULL;
+    }
+    
+    printf("Encoder thread started\n");
+    
+    while (true) {
+        Frame *frame = frame_queue_pop(queue);
+        if (!frame) break;  // Done
+        
+        fwrite(frame->data, 1, queue->width * queue->height * 4, ffmpeg);
+        frame->valid = false;
+    }
+    
+    pclose(ffmpeg);
+    printf("Encoder thread finished\n");
+    return NULL;
+}
+
+typedef struct {
+    Image front;
+    Image back;
+    bool swap_ready;
+    pthread_mutex_t mutex;
+} RenderBuffer;
+
+void *render_worker(void *arg) {
+    RenderBuffer *buf = (RenderBuffer *)arg;
+    int frame = 0;
+    
+    while (true) {
+        ImageClearBackground(&buf->back, BLACK);
+        
+        for (int i = 0; i < 5000; i++) {
+            int x = GetRandomValue(0, 511);
+            int y = GetRandomValue(0, 511);
+            Color c = {GetRandomValue(100, 255), 
+                      GetRandomValue(0, 100), 
+                      GetRandomValue(0, 100), 255};
+            ImageDrawPixel(&buf->back, x, y, c);
+        }
+        
+        ImageDrawText(&buf->back, TextFormat("Frame: %d", frame++), 
+                     10, 10, 30, WHITE);
+        
+        pthread_mutex_lock(&buf->mutex);
+        Image temp = buf->front;
+        buf->front = buf->back;
+        buf->back = temp;
+        buf->swap_ready = true;
+        pthread_mutex_unlock(&buf->mutex);
+        
+        usleep(16666);
+    }
+    return NULL;
+}
+
+int main(void) {
+    InitWindow(800, 600, "Threaded Video Encoder");
+    SetTargetFPS(60);
+    
+    const int VIDEO_WIDTH = 512;
+    const int VIDEO_HEIGHT = 512;
+    
+    RenderBuffer render_buf = {
+        .front = GenImageColor(VIDEO_WIDTH, VIDEO_HEIGHT, BLACK),
+        .back = GenImageColor(VIDEO_WIDTH, VIDEO_HEIGHT, BLACK),
+        .swap_ready = false
+    };
+    pthread_mutex_init(&render_buf.mutex, NULL);
+    
+    FrameQueue frame_queue;
+    frame_queue_init(&frame_queue, VIDEO_WIDTH, VIDEO_HEIGHT);
+    
+    pthread_t render_thread, encode_thread;
+    pthread_create(&render_thread, NULL, render_worker, &render_buf);
+    
+    Texture2D texture = LoadTextureFromImage(render_buf.front);
+    Image flippedImage = GenImageColor(VIDEO_WIDTH, VIDEO_HEIGHT, BLACK);
+    
+    bool recording = false;
+    bool encoder_running = false;
+    
+    while (!WindowShouldClose()) {
+        if (IsKeyPressed(KEY_R)) {
+            recording = !recording;
+            if (recording && !encoder_running) {
+                pthread_create(&encode_thread, NULL, encoder_thread, &frame_queue);
+                encoder_running = true;
+                printf("Recording started\n");
+            } else if (!recording && encoder_running) {
+                pthread_mutex_lock(&frame_queue.mutex);
+                frame_queue.done = true;
+                pthread_cond_signal(&frame_queue.not_empty);
+                pthread_mutex_unlock(&frame_queue.mutex);
+                
+                pthread_join(encode_thread, NULL);
+                encoder_running = false;
+                
+                frame_queue.done = false;
+                frame_queue.write_idx = 0;
+                frame_queue.read_idx = 0;
+                frame_queue.count = 0;
+                
+                printf("Recording stopped\n");
+            }
+        }
+        
+        pthread_mutex_lock(&render_buf.mutex);
+        if (render_buf.swap_ready) {
+            UpdateTexture(texture, render_buf.front.data);
+            
+            if (recording) {
+                memcpy(flippedImage.data, render_buf.front.data, 
+                       VIDEO_WIDTH * VIDEO_HEIGHT * 4);
+                ImageFlipVertical(&flippedImage);
+                frame_queue_push(&frame_queue, flippedImage.data);
+            }
+            
+            render_buf.swap_ready = false;
+        }
+        pthread_mutex_unlock(&render_buf.mutex);
+        
+        BeginDrawing();
+            ClearBackground(DARKGRAY);
+            DrawTexture(texture, 144, 44, WHITE);
+            DrawFPS(10, 10);
+            
+            if (recording) {
+                DrawText(TextFormat("REC - Queue: %d", frame_queue.count), 
+                        10, 30, 20, RED);
+            } else {
+                DrawText("Press R to toggle recording", 10, 30, 20, WHITE);
+            }
+        EndDrawing();
+    }
+    
+    // Cleanup
+    UnloadImage(flippedImage);
+    UnloadImage(render_buf.front);
+    UnloadImage(render_buf.back);
+    UnloadTexture(texture);
+    CloseWindow();
+    return 0;
+}
